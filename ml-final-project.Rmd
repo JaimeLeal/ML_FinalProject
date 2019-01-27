@@ -1,0 +1,172 @@
+---
+title: "Machine Learning - Final Project. Predicting the quality of dumbbell excercises"
+author: "Jaime Leal"
+abstract:
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(caret)
+library(parallel)
+library(doParallel)
+library(dplyr)
+```
+
+## Download the data sets
+The data for this project comes from this source: http://groupware.les.inf.puc-rio.br/har
+```{r}
+training_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+testing_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+training <- read.csv(url(training_url))
+testing <- read.csv(url(testing_url))
+
+print(dim(training))
+```
+
+## Data cleaning
+
+```{r}
+# Fix typo in column names. From "picth" to "pitch"
+colnames(training) <- gsub("picth","pitch",colnames(training))
+colnames(testing) <- gsub("picth","pitch",colnames(testing))
+
+```
+
+## Feature selection
+
+**Excluded features**
+
+From the analysis we exclude the calculated features and concentrate in the raw sensor data.
+We get the list of calculated features from the [paper](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201). Also, we exclude the columns related to the time of the measurement and `X` because it is just the row number. This reduces the number of features from 159 to 41.
+
+```{r}
+calculated_features_1 = grep("roll|pitch|yaw",colnames(training), value = T)
+calculated_features_2 = grep("min|max|avg|var|stddev|kurtosis|amplitude", colnames(training), value = T)
+calculated_features = union(calculated_features_1, calculated_features_2)
+
+id_cols = c("X"
+            ,"raw_timestamp_part_1"    
+            ,"raw_timestamp_part_2"
+            ,"cvtd_timestamp"
+            ,"new_window"
+            ,"num_window"  )
+
+
+cols_to_exclude = c(calculated_features, id_cols)
+# Print the list of selected features
+print(setdiff(colnames(training),cols_to_exclude))
+
+```
+
+**Selected features**
+
+For each of the 4 sensors:
+
+1. Belt
+2. Arm
+3. forearm
+4. Dumbbell
+
+there are 10 raw measurements:
+
+1. Total acceleration
+2. Gyros_x
+3. Gyros_y
+4. Gyros_z
+5. Acceleration_x
+6. Acceleration_y
+7. Acceleration_z
+8. Magnet_x
+9. Magnet_y
+10.Magnet_z
+
+Giving a total of 40 features, plus the `username`,that will be used to predict `classe`.
+
+
+### Zero variance
+We check for zero variance, to see if there is an opportunity to drop some columns. But none of the columns have zero variance.
+
+```{r}
+zero_var <- nearZeroVar(training %>% select(-one_of(cols_to_exclude)),names = T)
+print(zero_var)
+```
+
+### Missing values
+The features that we selected are complete and there is no reason to impute.
+```{r}
+Amelia::missmap(training %>% select(-one_of(cols_to_exclude)))
+
+```
+
+## Model training and selection
+We train 5 models in the training data set: rf, gbm, knn, lda, qda; and then we choose the best one based on its accuracy.
+
+**Cross validation**: We perform 10 k-fold Cross Validation to choose the best parameters for the model and to estimate the out of bag (OOB) error. We specify this condition in the `trainControl` object.
+
+```{r,warning=FALSE, cache=TRUE}
+# Formula
+cols = setdiff(colnames(training), cols_to_exclude)
+cols = setdiff(cols, "classe")
+formula_str = sprintf("classe ~ %s", paste(cols,collapse = "+"))
+
+
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+
+fitControl <- trainControl(method = "cv",
+                           number = 10)
+set.seed(1234)
+mod_rf <- train(as.formula(formula_str), training, method = "rf", trControl = fitControl)
+mod_gbm <- train(as.formula(formula_str), training, method = "gbm", trControl = fitControl)
+mod_knn <- train(as.formula(formula_str), training, method = "knn", trControl = fitControl)
+mod_lda <- train(as.formula(formula_str), training, method = "lda", trControl = fitControl)
+mod_qda <- train(as.formula(formula_str), training, method = "qda", trControl = fitControl)
+
+stopCluster(cluster)
+registerDoSEQ()
+```
+
+## Selected model: random forest
+We choose the random forest model because it has the highest accuracy of the 5 models.
+
+```{r, warning=FALSE}
+results = data.frame(
+models = c("rf","gbm","knn","lda","qda"),
+Accuracy = c( max(mod_rf$results$Accuracy)
+             ,max(mod_gbm$results$Accuracy)
+             ,max(mod_knn$results$Accuracy)
+             ,max(mod_lda$results$Accuracy)
+             ,max(mod_qda$results$Accuracy))
+)
+
+results <- results %>% arrange(-Accuracy)
+print(results)
+```
+
+
+## Confusion matrix and out of bag  (OBB) error
+
+The OBB error is estimated at 0.9%.
+
+```{r}
+print(mod_rf$finalModel$confusion)
+#https://jarrettmeyer.com/2016/10/20/quickly-computing-oob-error-estimates
+
+computeOOBErrEst <- function (x)
+{
+  cm <- x$confusion
+  cm <- cm[, -ncol(cm)]
+  1 - sum(diag(cm)) / sum(cm)
+}
+
+print(sprintf("OBB error is: %s %%",round(computeOOBErrEst(mod_rf$finalModel)*100,2)))
+```
+
+## Predict test set for submission
+```{r}
+prediction <- predict(mod_rf,testing)
+print(data.frame(problem_id = testing$problem_id, classe = prediction))
+```
